@@ -172,12 +172,23 @@ export default class BilibiliSource extends BaseSource {
 
       const results = [];
       for (const item of data.data.result) {
-        const mediaId = item.season_id ? `ss${item.season_id}` : item.bvid ? `bv${item.bvid}` : "";
+        let mediaId = "";
+        if (searchType === "video") {
+          if (!item.bvid) continue;
+          mediaId = item.bvid;  // 普通视频直接用 bvid (如 "BV1xxx")
+        } else if (item.season_id) {
+          mediaId = `ss${item.season_id}`;
+        } else if (item.bvid) {
+          mediaId = `bv${item.bvid}`;
+        }
         if (!mediaId) continue;
 
-        // 提取媒体类型（参考 bilibili.py 和优化后的 youku.js）
-        const mediaType = this._extractMediaType(item.season_type_name);
-        const episodeCount = mediaType === "电影" ? 1 : (item.ep_size || 0);
+        const mediaType = searchType === "video"
+          ? "普通视频"
+          : this._extractMediaType(item.season_type_name);
+        const episodeCount = searchType === "video"
+          ? 0
+          : (mediaType === "电影" ? 1 : (item.ep_size || 0));
 
         // 提取年份
         let year = null;
@@ -221,7 +232,7 @@ export default class BilibiliSource extends BaseSource {
 		  org_title: cleanedOrgTitle,
           type: mediaType,
           year,
-          imageUrl: item.cover || null,
+          imageUrl: item.cover || item.pic || null,
           episodeCount
         };
 
@@ -286,7 +297,7 @@ export default class BilibiliSource extends BaseSource {
       log("info", `[Bilibili] 开始搜索: ${keyword}`);
 
       const mixinKey = await this._getWbiMixinKey();
-      const searchTypes = ["media_bangumi", "media_ft"];
+      const searchTypes = ["media_bangumi", "media_ft", "video"];
 
       const searchPromises = searchTypes.map(type => this._searchByType(keyword, type, mixinKey));
       const tasks = [...searchPromises];
@@ -298,6 +309,12 @@ export default class BilibiliSource extends BaseSource {
       }
 
       const results = await Promise.all(tasks);
+
+      // video 结果只保留前5个，避免太杂
+      const videoIdx = searchTypes.indexOf("video");
+      if (videoIdx !== -1 && results[videoIdx]) {
+        results[videoIdx] = results[videoIdx].slice(0, 5);
+      }
 
       // 合并结果并去重
       const allResults = results.flat();
@@ -416,9 +433,9 @@ export default class BilibiliSource extends BaseSource {
     if (id.startsWith('ss')) {
       const seasonId = id.substring(2);
       return await this._getPgcEpisodes(seasonId);
-    } else if (id.startsWith('bv')) {
-      const bvid = id.substring(2);
-      return await this._getUgcEpisodes(bvid);
+    } else if (id.toLowerCase().startsWith('bv')) {
+      // 普通视频: bvid 本身就是完整的 (如 "BV1xxx")
+      return await this._getUgcEpisodes(id);
     }
 
     log("error", `[Bilibili] 不支持的 ID 格式: ${id}`);
