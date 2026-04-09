@@ -1159,6 +1159,18 @@ export async function matchAnime(url, req, clientIp) {
 export async function searchEpisodes(url) {
   let anime = url.searchParams.get("anime");
   const episode = url.searchParams.get("episode") || "";
+  let seasonRaw = url.searchParams.get("season") || "";
+  // Flexible season parsing: accept Arabic digits, Chinese numbers, or "S2" format
+  let season = "";
+  if (/^\d+$/.test(seasonRaw)) {
+    season = seasonRaw;
+  } else if (/^[sS]\d+$/.test(seasonRaw)) {
+    season = seasonRaw.replace(/^[sS]/, '');
+  } else if (/^[一二三四五六七八九十壹贰叁肆伍陆柒捌玖拾]+$/.test(seasonRaw)) {
+    season = String(convertChineseNumber(seasonRaw));
+  } else {
+    season = seasonRaw; // pass through as-is
+  }
 
   // 如果启用了搜索关键字繁转简，则进行转换
   if (globals.animeTitleSimplified) {
@@ -1167,7 +1179,7 @@ export async function searchEpisodes(url) {
     anime = simplifiedTitle;
   }
 
-  log("info", `Search episodes with anime: ${anime}, episode: ${episode}`);
+  log("info", `Search episodes with anime: ${anime}, episode: ${episode}, season: ${season}`);
 
   if (!anime) {
     log("error", "Missing anime parameter");
@@ -1195,10 +1207,68 @@ export async function searchEpisodes(url) {
     });
   }
 
+  // 类型优先级评分（越高越优先）
+  const typeScoreMap = {
+    "电视剧": 100,
+    "电影": 90,
+    "纪录片": 60,
+    "综艺": 40,
+    "动漫": 30,
+    "普通视频": 10,
+  };
+
   let resultAnimes = [];
 
   // 遍历所有找到的动漫，获取它们的集数信息
   for (const animeItem of searchData.animes) {
+
+    // ====== 季数过滤 ======
+    if (season && /^\d+$/.test(season)) {
+      const seasonNum = parseInt(season);
+      // 使用已有的 matchSeason 函数进行季数匹配
+      if (!matchSeason(animeItem, anime, seasonNum)) {
+        // matchSeason 失败，尝试标题中直接包含 "第X季" 的模式
+        const titleLower = animeItem.animeTitle;
+        const seasonPatterns = [
+          new RegExp(`第${seasonNum}季`),
+          new RegExp(`第${numberToChinese(seasonNum)}季`),
+          new RegExp(`[Ss](?:eason)?\\s*0*${seasonNum}(?![0-9])`),
+          // "绝命毒师第二季" pattern
+        ];
+        const matchesAnySeason = seasonPatterns.some(p => p.test(titleLower));
+        
+        // 如果标题里明确包含其他季数（不是目标季），则跳过
+        const otherSeasonMatch = titleLower.match(/第([一二三四五六七八九十d]+)季/);
+        if (otherSeasonMatch) {
+          const matchedNum = /\d+/.test(otherSeasonMatch[1]) 
+            ? parseInt(otherSeasonMatch[1]) 
+            : convertChineseNumber(otherSeasonMatch[1]);
+          if (matchedNum && matchedNum !== seasonNum) {
+            log("info", `[searchEpisodes] Skipping ${animeItem.animeTitle} (season ${matchedNum} != ${seasonNum})`);
+            continue;
+          }
+        }
+        
+        // 如果标题包含 "Season X" 但不是目标季，跳过
+        const engSeasonMatch = titleLower.match(/[Ss]eason\s*(\d+)/i);
+        if (engSeasonMatch) {
+          const matchedNum = parseInt(engSeasonMatch[1]);
+          if (matchedNum !== seasonNum) {
+            log("info", `[searchEpisodes] Skipping ${animeItem.animeTitle} (Season ${matchedNum} != ${seasonNum})`);
+            continue;
+          }
+        }
+
+        // 如果标题明确标注了不同的季数编号，跳过
+        const numSeasonMatch = titleLower.match(/第(\d+)季/);
+        if (numSeasonMatch && parseInt(numSeasonMatch[1]) !== seasonNum) {
+          continue;
+        }
+
+        // 对于 "全X季" 或没有季数标注的通用结果，保留（但排序时降权）
+      }
+    }
+
     const detailAnime =
       resolveAnimeById(animeItem.bangumiId, requestAnimeDetailsMap, animeItem.source) ||
       resolveAnimeById(animeItem.animeId, requestAnimeDetailsMap, animeItem.source);
@@ -1238,28 +1308,67 @@ export async function searchEpisodes(url) {
 
       // 只有当过滤后还有集数时才添加到结果中
       if (filteredEpisodes.length > 0) {
-        resultAnimes.push(Episodes.fromJson({
-          animeId: animeItem.animeId,
-          animeTitle: animeItem.animeTitle,
-          type: animeItem.type,
-          typeDescription: animeItem.typeDescription,
-          episodes: filteredEpisodes.map(ep => ({
-            episodeId: ep.episodeId,
-            episodeTitle: ep.episodeTitle
-          }))
-        }));
+        // 计算排序分数
+        const typeDesc = animeItem.typeDescription || "";
+        const typeScore = typeScoreMap[typeDesc] || 20;
+        const episodeCountScore = bangumiData.bangumi.episodes.length; // 总集数越多 = 越可能是正片
+        
+        // 惩罚标题中包含 "解说" "reaction" "一口气" "看完" 等关键词的结果
+        const penaltyKeywords = ["解说", "reaction", "一口气", "看完", "看爽", "速看", "合集", "剪辑", "混剪", "盘点"];
+        const titleLower = animeItem.animeTitle.toLowerCase();
+        const hasPenalty = penaltyKeywords.some(kw => titleLower.includes(kw.toLowerCase()));
+        const penaltyScore = hasPenalty ? -500 : 0;
+        
+        // 季数精确匹配加分
+        let seasonBonus = 0;
+        if (season && /^\d+$/.test(season)) {
+          const seasonNum = parseInt(season);
+          if (matchSeason(animeItem, anime, seasonNum)) {
+            seasonBonus = 200; // 精确季数匹配大加分
+          }
+        }
+
+        const sortScore = typeScore + episodeCountScore + penaltyScore + seasonBonus;
+
+        resultAnimes.push({
+          data: Episodes.fromJson({
+            animeId: animeItem.animeId,
+            animeTitle: animeItem.animeTitle,
+            type: animeItem.type,
+            typeDescription: animeItem.typeDescription,
+            episodes: filteredEpisodes.map(ep => ({
+              episodeId: ep.episodeId,
+              episodeTitle: ep.episodeTitle
+            }))
+          }),
+          sortScore: sortScore
+        });
       }
     }
   }
 
-  log("info", `Found ${resultAnimes.length} animes with filtered episodes`);
+  // ====== 按分数排序（降序）======
+  resultAnimes.sort((a, b) => b.sortScore - a.sortScore);
+  
+  log("info", `Found ${resultAnimes.length} animes with filtered episodes, sorted by relevance`);
+  if (resultAnimes.length > 0) {
+    log("info", `Top results: ${resultAnimes.slice(0, 5).map(r => `[${r.sortScore}] ${r.data.animeTitle}`).join(" | ")}`);
+  }
 
   return jsonResponse({
     errorCode: 0,
     success: true,
     errorMessage: "",
-    animes: resultAnimes
+    animes: resultAnimes.map(r => r.data)
   });
+}
+
+// Helper: number to Chinese (for season matching)
+function numberToChinese(num) {
+  const chars = ['零','一','二','三','四','五','六','七','八','九','十'];
+  if (num <= 10) return chars[num];
+  if (num < 20) return '十' + (num % 10 === 0 ? '' : chars[num % 10]);
+  return String(num);
 }
 
 // Extracted function for GET /api/v2/bangumi/:animeId
