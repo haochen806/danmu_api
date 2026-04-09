@@ -73,6 +73,77 @@ const tmdbSource = new TmdbSource(doubanSource);
 // 用于聚合请求的去重Map
 const PENDING_DANMAKU_REQUESTS = new Map();
 
+// Helper: fetch danmu count for a URL without full processing (used for search ranking)
+async function fetchDanmuCountByUrl(url, timeoutMs = 8000) {
+  if (!url) return 0;
+
+  // Check cache first
+  const cached = getCommentCache(url);
+  if (cached !== null) {
+    return cached.length;
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let danmus = [];
+    const segmentFlag = false;
+
+    const fetchPromise = (async () => {
+      if (url.includes('.qq.com')) {
+        return await tencentSource.getComments(url, 'qq', segmentFlag);
+      } else if (url.includes('.iqiyi.com')) {
+        return await iqiyiSource.getComments(url, 'qiyi', segmentFlag);
+      } else if (url.includes('.mgtv.com')) {
+        return await mangoSource.getComments(url, 'imgo', segmentFlag);
+      } else if (url.includes('.bilibili.com') || url.includes('b23.tv')) {
+        let resolvedUrl = url;
+        if (url.includes('b23.tv')) {
+          resolvedUrl = await bilibiliSource.resolveB23Link(url);
+        }
+        return await bilibiliSource.getComments(resolvedUrl, 'bilibili1', segmentFlag);
+      } else if (url.includes('.youku.com')) {
+        return await youkuSource.getComments(url, 'youku', segmentFlag);
+      } else if (url.includes('.miguvideo.com')) {
+        return await miguSource.getComments(url, 'migu', segmentFlag);
+      } else if (url.includes('.sohu.com')) {
+        return await sohuSource.getComments(url, 'sohu', segmentFlag);
+      } else if (url.includes('.le.com')) {
+        return await leshiSource.getComments(url, 'leshi', segmentFlag);
+      } else if (url.includes('.douyin.com') || url.includes('.ixigua.com')) {
+        return await xiguaSource.getComments(url, 'xigua', segmentFlag);
+      } else if (url.includes('.mddcloud.com.cn')) {
+        return await maiduiduiSource.getComments(url, 'maiduidui', segmentFlag);
+      } else if (url.includes('.yfsp.tv')) {
+        return await aiyifanSource.getComments(url, 'aiyifan', segmentFlag);
+      }
+      return [];
+    })();
+
+    danmus = await Promise.race([
+      fetchPromise,
+      new Promise((_, reject) => {
+        const id = setTimeout(() => {
+          clearTimeout(id);
+          reject(new Error('Danmu fetch timeout'));
+        }, timeoutMs);
+      })
+    ]);
+
+    clearTimeout(timer);
+
+    if (danmus && danmus.length > 0) {
+      setCommentCache(url, danmus);
+    }
+
+    return (danmus && danmus.length) || 0;
+  } catch (e) {
+    log("info", `[fetchDanmuCount] Failed for ${url}: ${e.message}`);
+    return 0;
+  }
+}
+
 function normalizeDurationValue(rawValue) {
   const duration = Number(rawValue || 0);
   if (!Number.isFinite(duration) || duration <= 0) return 0;
@@ -1347,12 +1418,49 @@ export async function searchEpisodes(url) {
     }
   }
 
+    // ====== 获取弹幕数量用于排序 ======
+  log("info", `[searchEpisodes] Fetching danmu counts for ${resultAnimes.length} results...`);
+
+  // For each result, get the target episode's URL and fetch danmu count in parallel
+  const danmuCountPromises = resultAnimes.map(async (r) => {
+    try {
+      // Get the first filtered episode's ID (this is the target episode)
+      const targetEp = r.data.episodes[0];
+      if (!targetEp) return 0;
+
+      const episodeId = targetEp.episodeId;
+      const url = findUrlById(episodeId);
+      if (!url) {
+        log("info", `[searchEpisodes] No URL found for episode ${episodeId}, danmu count = 0`);
+        return 0;
+      }
+
+      const count = await fetchDanmuCountByUrl(url, 8000);
+      log("info", `[searchEpisodes] Danmu count for ${r.data.animeTitle} ep ${episodeId}: ${count}`);
+      return count;
+    } catch (e) {
+      log("info", `[searchEpisodes] Error fetching danmu for ${r.data.animeTitle}: ${e.message}`);
+      return 0;
+    }
+  });
+
+  const danmuCounts = await Promise.allSettled(danmuCountPromises);
+
+  // Add danmu count to sort score
+  for (let i = 0; i < resultAnimes.length; i++) {
+    const count = danmuCounts[i].status === 'fulfilled' ? danmuCounts[i].value : 0;
+    resultAnimes[i].danmuCount = count;
+    // Danmu count is a strong signal: each danmu adds 1 point to the score
+    // This means a source with 500+ danmu will easily outrank type-only scoring
+    resultAnimes[i].sortScore += count;
+  }
+
   // ====== 按分数排序（降序）======
   resultAnimes.sort((a, b) => b.sortScore - a.sortScore);
-  
-  log("info", `Found ${resultAnimes.length} animes with filtered episodes, sorted by relevance`);
+
+  log("info", `Found ${resultAnimes.length} animes with filtered episodes, sorted by relevance (with danmu counts)`);
   if (resultAnimes.length > 0) {
-    log("info", `Top results: ${resultAnimes.slice(0, 5).map(r => `[${r.sortScore}] ${r.data.animeTitle}`).join(" | ")}`);
+    log("info", `Top results: ${resultAnimes.slice(0, 5).map(r => `[${r.sortScore}, danmu=${r.danmuCount}] ${r.data.animeTitle}`).join(" | ")}`);
   }
 
   return jsonResponse({
@@ -1360,8 +1468,7 @@ export async function searchEpisodes(url) {
     success: true,
     errorMessage: "",
     animes: resultAnimes.map(r => r.data)
-  });
-}
+  });}
 
 // Helper: number to Chinese (for season matching)
 function numberToChinese(num) {
