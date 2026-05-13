@@ -930,12 +930,12 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
         }
     }
 
-    // 3. 匹配结果处理与评分比较
+    // 3. 匹配结果处理与评分比较 (enhanced with type scoring)
     if (matchedEpisode) {
         // 计算当前匹配的得分
         const actualPlatform = extractPlatformFromTitle(anime.animeTitle) || anime.source;
         let currentScore = 0;
-        
+
         if (platform) {
             // 如果指定了平台偏好，计算匹配得分
             currentScore = getPlatformMatchScore(actualPlatform, platform);
@@ -944,8 +944,40 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
             currentScore = 1;
         }
 
+        // === Type-based scoring bonus ===
+        // 电视剧 should be strongly preferred over 动漫/2D动漫 for live-action content
+        const typeDesc = anime.typeDescription || anime.type || "";
+        const matchTypeScoreMap = {
+            "电视剧": 1000,
+            "电影": 900,
+            "纪录片": 600,
+            "综艺": 400,
+            "动漫": 300,
+            "2D动漫": 300,
+            "TV动画": 300,
+            "普通视频": 100,
+        };
+        currentScore += (matchTypeScoreMap[typeDesc] || 200);
+
+        // === Title match quality bonus ===
+        // Exact title match gets a big bonus over partial/substring match
+        const animeTitleClean = anime.animeTitle.split("(")[0].replace(/【.*?】/g, "").trim();
+        const animeTitleBase = animeTitleClean.replace(/from\s+\w+$/, "").trim();
+        if (animeTitleBase === normalizedTitle || animeTitleClean.startsWith(normalizedTitle + "(")) {
+            currentScore += 500; // Exact match bonus
+        }
+
+        // === Derivative title penalty ===
+        // Penalize titles that are clearly derivative content (大聪明版, 解说, reaction, etc.)
+        const derivativeKeywords = ["大聪明版", "解说", "reaction", "一口气", "看完", "看爽", "速看", "合集", "剪辑", "混剪", "盘点"];
+        const titleLower = anime.animeTitle.toLowerCase();
+        if (derivativeKeywords.some(kw => titleLower.includes(kw.toLowerCase()))) {
+            currentScore -= 2000; // Heavy penalty for derivative content
+        }
+
+        log("info", `[matchAniAndEp] Score for ${anime.animeTitle}: ${currentScore} (type=${typeDesc}, platform=${platform || 'none'})`);
+
         // 比较并更新最佳结果
-        // 逻辑：如果有更好的分数，或者之前没有匹配到任何结果，则更新
         if (currentScore > bestRes.score) {
              bestRes = {
                 anime: anime,
@@ -954,13 +986,7 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
             };
         }
 
-        // 如果没有指定平台偏好 (platform 为空)，则保持原版行为：
-        // 找到第一个符合条件的就立刻返回，不进行后续比较
-        if (!platform) {
-            break; 
-        }
-        
-        // 如果指定了平台偏好，则继续循环查找是否有得分更高的源（最小杂质匹配）
+        // Always continue to find best match — don't break on first match even without platform preference
     }
   }
 
@@ -968,7 +994,14 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
 }
 
 async function fallbackMatchAniAndEp(searchData, req, season, episode, year, resEpisode, resAnime, offsets, detailStore = null) {
-  for (const anime of searchData.animes) {
+  // Sort animes by type preference before fallback iteration
+  const typeOrder = { "电视剧": 0, "电影": 1, "纪录片": 2, "综艺": 3, "动漫": 4, "2D动漫": 4, "TV动画": 4, "普通视频": 5 };
+  const sortedAnimes = [...searchData.animes].sort((a, b) => {
+    const aType = typeOrder[a.typeDescription || a.type || ""] ?? 6;
+    const bType = typeOrder[b.typeDescription || b.type || ""] ?? 6;
+    return aType - bType;
+  });
+  for (const anime of sortedAnimes) {
     // 年份匹配优先（如果提供了年份）
     if (year && !matchYear(anime, year)) {
       log("info", `Fallback: Year mismatch: anime year ${extractYear(anime.animeTitle)} vs query year ${year}`);
