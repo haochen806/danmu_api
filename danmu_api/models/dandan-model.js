@@ -6,7 +6,8 @@ import { validateType } from "../utils/common-util.js";
 export class Anime {
   constructor({ animeId = 111, bangumiId = "", animeTitle = "", type = "",
                 typeDescription = "", imageUrl = "", startDate = "", episodeCount = 1,
-                rating = 0, isFavorited = true, source = "", links = [] } = {}) {
+                rating = 0, isFavorited = true, source = "", links = [],
+                mergedChildren = [], isHiddenChild = false } = {}) {
     // ---- 类型检查 ----
     validateType(animeId, "number");
     validateType(bangumiId, "string");
@@ -20,13 +21,15 @@ export class Anime {
     validateType(isFavorited, "boolean");
     validateType(source, "string");
     validateType(links, "array");
+    validateType(mergedChildren, "array");
+    validateType(isHiddenChild, "boolean");
 
     // 将 links 转换为 Link 实例数组
     this.links = links.map(linkData => Link.fromJson(linkData));
 
     // 直接解构并赋值给 this
     Object.assign(this, { animeId, bangumiId, animeTitle, type, typeDescription, imageUrl, startDate,
-      episodeCount, rating, isFavorited, source });
+      episodeCount, rating, isFavorited, source, mergedChildren, isHiddenChild  });
   }
 
   // ---- 静态方法：从 JSON 创建 Anime 对象 ----
@@ -79,7 +82,7 @@ class Link {
 // =====================
 export class AnimeMatch {
   constructor({ episodeId = 10001, animeId = 111, animeTitle = "", episodeTitle = "",
-                type = "", typeDescription = "", shift = 1, imageUrl = "" } = {}) {
+                type = "", typeDescription = "", shift = 1, imageUrl = "", url = "" } = {}) {
     // ---- 类型检查 ----
     validateType(episodeId, "number");
     validateType(animeId, "number");
@@ -89,9 +92,10 @@ export class AnimeMatch {
     validateType(typeDescription, "string");
     validateType(shift, "number");
     validateType(imageUrl, "string");
+    validateType(url, "string");
 
     // 直接解构并赋值给 this
-    Object.assign(this, { episodeId, animeId, animeTitle, episodeTitle, type, typeDescription, shift, imageUrl });
+    Object.assign(this, { episodeId, animeId, animeTitle, episodeTitle, type, typeDescription, shift, imageUrl, url });
   }
 
   // ---- 静态方法：从 JSON 创建 User 对象 ----
@@ -112,9 +116,10 @@ export class AnimeMatch {
 // 数据模型：Episode
 // =====================
 export class Episode {
-  constructor({ episodeId = "", episodeTitle = "" } = {}) {
+  constructor({ episodeId = "", episodeTitle = "", url = "" } = {}) {
     this.episodeId = episodeId;
     this.episodeTitle = episodeTitle;
+    this.url = url;
   }
 }
 
@@ -122,7 +127,8 @@ export class Episode {
 Episode.prototype.toJson = function () {
   return {
     episodeId: this.episodeId,
-    episodeTitle: this.episodeTitle
+    episodeTitle: this.episodeTitle,
+    url: this.url
   };
 };
 
@@ -194,15 +200,16 @@ export class Season {
 // =====================
 export class BangumiEpisode {
   constructor({ seasonId = "", episodeId = 10001, episodeTitle = "", episodeNumber = "",
-                airDate = "" } = {}) {
+                airDate = "", url = "" } = {}) {
     validateType(seasonId, "string");
     validateType(episodeId, "number");
     validateType(episodeTitle, "string");
     validateType(episodeNumber, "string");
     validateType(airDate, "string");
+    validateType(url, "string");
 
     // 直接解构并赋值给 this
-    Object.assign(this, { seasonId, episodeId, episodeTitle, episodeNumber, airDate });
+    Object.assign(this, { seasonId, episodeId, episodeTitle, episodeNumber, airDate, url });
   }
 
   // ---- 静态方法：从 JSON 创建 BangumiEpisode 对象 ----

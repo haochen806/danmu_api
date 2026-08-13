@@ -82,7 +82,7 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 - 手动匹配测试：搜索动漫 → 选择番剧 → 选择剧集 → 获取弹幕
 - 弹幕统计：弹幕数、时长、高能时刻、平均密度、匹配时长、类型分布
 - 弹幕热力图：按时间段可视化弹幕密度分布
-- 弹幕列表：支持全部/滚动/顶部/底部过滤，显示颜色和类型标签，懒加载每次100条
+- 弹幕列表：支持全部/滚动/顶部/底部过滤，显示颜色和类型标签，首次加载及每次加载更多500条
 - 导出功能：支持导出JSON和XML格式弹幕文件
 - 时长处理：优先请求 `/api/v2/comment/:commentId?format=json&duration=true` 返回的 `videoDuration`，没有真实时长时再回退到尾部裁剪算法
 - 视图导航优化：搜索结果/剧集详情/弹幕详情逐级切换，带返回按钮和加载动画
@@ -162,8 +162,33 @@ UI 系统需要通过在 URL 中添加 TOKEN 来访问，以确保安全性：
 | Netlify | ✅ | ✅ | ✅ |
 | EdgeOne | ❌ | ✅ | ✅ |
 | Cloudflare | ✅ | ✅ | ✅ |
+| Hugging Face Spaces | ✅ | ✅ | ✅ |
 | Node.js | ❌ | ❌ | ❌ |
 | Docker | ❌ | ❌ | ❌ |
+
+---
+
+### 5. Hugging Face Spaces 平台
+
+#### 需要的变量
+- `DEPLOY_PLATFROM_ACCOUNT`: Hugging Face 用户名或组织名
+- `DEPLOY_PLATFROM_PROJECT`: Space 名称
+- `DEPLOY_PLATFROM_TOKEN`: User Access Token
+
+#### 获取步骤
+
+**获取 Account 与 Space 名称**
+
+1. 打开你的 Hugging Face Space 页面
+2. Space 地址格式为 `https://huggingface.co/spaces/{account}/{space}`
+3. `{account}` 填入 `DEPLOY_PLATFROM_ACCOUNT`，`{space}` 填入 `DEPLOY_PLATFROM_PROJECT`
+
+**获取 User Access Token (`DEPLOY_PLATFROM_TOKEN`)**
+
+1. 登录 [Hugging Face Access Tokens](https://huggingface.co/settings/tokens)
+2. 创建 Fine-grained token 或 Write token
+3. 如果使用 Fine-grained token，请授予目标 Space 的写入权限
+4. **立即复制并保存** Token(只显示一次)
 
 ---
 

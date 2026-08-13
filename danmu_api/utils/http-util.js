@@ -1,62 +1,146 @@
 import { globals } from '../configs/globals.js';
 import { log } from './log-util.js'
+import { AsyncLocalStorage } from 'node:async_hooks';
+import https from 'node:https';
+import http from 'node:http';
+
+// 跨异步生命周期链路的日志上下文追踪器
+export const sourceLogContext = new AsyncLocalStorage();
+
+// 单次搜索请求内的 HTTP 响应复用缓存: 相同 URL 的重复 GET 直接复用, 借助 AsyncLocalStorage 实现请求级隔离
+export const httpCacheContext = new AsyncLocalStorage();
+
+export function runWithHttpCache(fn) {
+  return httpCacheContext.run(new Map(), fn);
+}
+
+// 源调度键名（sourceOrderArr）到日志标签规范名称的映射
+// sourceOrderArr 中部分键名与对应源文件的标签命名不一致（如 360→360kan, imgo→mango）
+// 此映射表统一转换，确保 HTTP 日志标签与源文件内部标签一致
+const SOURCE_KEY_TO_LOG_NAME = {
+  '360': '360kan',
+  'imgo': 'mango',
+};
+
+/**
+ * 将 sourceOrderArr 中的调度键名转换为日志标签规范名称
+ * @param {string} sourceKey - sourceOrderArr 中的键名
+ * @returns {string} 对应的日志标签名称，如无映射则返回原值
+ */
+export function toLogSourceName(sourceKey) {
+  return SOURCE_KEY_TO_LOG_NAME[sourceKey] || sourceKey;
+}
 
 // =====================
 // 请求工具方法
 // =====================
 
 /**
- * 将外部中断信号链接到内部控制器
+ * 将外部中断信号链接到内部控制器，并返回内存清理函数
  * @param {AbortSignal} externalSignal 外部传入的信号
  * @param {AbortController} internalController 内部使用的控制器
+ * @returns {Function} 监听器清理闭包
  */
 function linkSignal(externalSignal, internalController) {
-  if (externalSignal) {
-    if (externalSignal.aborted) {
-      internalController.abort();
-    } else {
-      externalSignal.addEventListener('abort', () => {
-        internalController.abort();
-      }, { once: true });
-    }
+  if (!externalSignal) return () => { };
+
+  if (externalSignal.aborted) {
+    internalController.abort();
+    return () => { };
   }
+
+  const abortHandler = () => {
+    internalController.abort();
+  };
+
+  externalSignal.addEventListener('abort', abortHandler, { once: true });
+
+  // 返回注销函数，供请求结束后的 finally 块调用，阻断内存泄漏链
+  return () => {
+    externalSignal.removeEventListener('abort', abortHandler);
+  };
+}
+
+// 旧版 Node（<20.19.0，自带 undici 解析响应头时丢弃 Set-Cookie）与 iOS 巨魔（无 WebAssembly、无原生 fetch）改用 node-fetch v3（其 Headers 正常暴露 Set-Cookie）；降级边界与 esm-shim 的 20.19.0 一致，Node >= 20.19.0 仍用原生 fetch。判定仅依赖静态环境、进程内恒定，故模块加载时算一次并缓存。
+function detectNodeFetchDowngrade() {
+  if (typeof WebAssembly === 'undefined') return true;
+  const [major, minor] = process.versions.node.split('.').map(Number);
+  return major < 20 || (major === 20 && minor < 19);
+}
+
+const USE_NODE_FETCH = detectNodeFetchDowngrade();
+if (USE_NODE_FETCH) {
+  // 模块载入时 logLevel 尚未初始化，用 console.log 保证启动提示必现
+  console.log("[system] [http] 检测到旧版Node/iOS环境，已全局切换至 node-fetch v3 作为请求实现");
+}
+
+// 降级分支共享 keep-alive Agent，复用 TCP/TLS 连接以与原生 undici 连接池达到实际等价（消除重复握手开销）；按协议区分 https/http
+const nodeFetchHttpsAgent = USE_NODE_FETCH ? new https.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: 256 }) : null;
+const nodeFetchHttpAgent = USE_NODE_FETCH ? new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, maxSockets: 256 }) : null;
+function nodeFetchAgent(parsedUrl) {
+  const protocol = parsedUrl instanceof URL ? parsedUrl.protocol : new URL(parsedUrl).protocol;
+  return protocol === 'https:' ? nodeFetchHttpsAgent : nodeFetchHttpAgent;
+}
+
+function shouldUseNodeFetch() {
+  return USE_NODE_FETCH;
 }
 
 export async function httpGet(url, options = {}) {
+  // 单次搜索请求内 HTTP 响应复用: 若当前请求上下文已激活复用缓存且本 URL 已缓存, 直接返回克隆结果, 跳过重复网络请求
+  const requestHttpCache = httpCacheContext.getStore();
+  // 重试调用传入 bypassCache 时跳过复用，避免复用首次已缓存的失败响应而令重试被静默吞掉
+  const bypassCache = options.bypassCache === true;
+  if (requestHttpCache && !bypassCache && requestHttpCache.has(url)) {
+    const cached = requestHttpCache.get(url);
+    log("info", `[${sourceLogContext.getStore() || 'system'}] [请求复用] 复用请求内已缓存的 HTTP 响应, 跳过重复请求: ${url}`);
+    return { data: structuredClone(cached.data), status: cached.status, headers: { ...cached.headers } };
+  }
+
   // 从 options 中获取重试次数，默认为 0
   const maxRetries = parseInt(options.retries || '0', 10) || 0;
+  // 提取允许放行的特定状态码白名单
+  const validStatusCodes = Array.isArray(options.validStatusCodes) ? options.validStatusCodes : [];
   let lastError;
 
   // 执行请求，包含重试逻辑
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // 获取当前异步生命周期的源标识
+    const currentSource = sourceLogContext.getStore() || "system";
+
     if (attempt > 0) {
-      log("info", `[请求模拟] 第 ${attempt} 次重试: ${url}`);
-      // 可选：添加重试延迟（指数退避）
-      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+      log("info", `[${currentSource}] [请求模拟] 第 ${attempt} 次重试: ${url}`);
+      // 针对网络层物理阻断（如 ETIMEDOUT, ECONNRESET, AbortError）取消长退避，实现快速重试
+      // 常规服务端报错（如 502, 429）保持指数退避逻辑
+      if (lastError && (lastError.cause?.code === 'ETIMEDOUT' || lastError.cause?.code === 'ECONNRESET' || lastError.name === 'AbortError')) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } else {
+        await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+      }
     } else {
-      log("info", `[请求模拟] HTTP GET: ${url}`);
+      log("info", `[${currentSource}] [请求模拟] HTTP GET: ${url}`);
     }
 
     // 设置超时时间（默认5秒）
-    const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
+    const timeout = parseInt(options.timeout || globals.vodRequestTimeout || '5000', 10) || 5000;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-    // 链接外部中断信号
-    linkSignal(options.signal, controller);
+    // 链接外部中断信号并获取清理函数
+    const cleanupSignal = linkSignal(options.signal, controller);
 
     try {
-      // 兼容iOS巨魔环境：使用node-fetch替代内置fetch
+      // 兼容iOS巨魔或旧版Node：使用node-fetch替代内置fetch
       let response;
-      if (typeof WebAssembly === 'undefined') {
-        log("info", "iOS环境降级使用node-fetch");
+      if (shouldUseNodeFetch()) {
         const fetch = (await import('node-fetch')).default;
         response = await fetch(url, {
           method: 'GET',
           headers: {
             ...options.headers,
           },
-          signal: controller.signal
+          signal: controller.signal,
+          agent: nodeFetchAgent
         });
       } else {
         // 现代浏览器环境
@@ -71,14 +155,15 @@ export async function httpGet(url, options = {}) {
 
       clearTimeout(timeoutId);
 
-      if (!response.ok) {
+      // 非 2xx 且不在白名单内的状态码抛出异常
+      if (!response.ok && !validStatusCodes.includes(response.status)) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
       let data;
 
       if (options.base64Data) {
-        log("info", "base64模式");
+        log("info", "[system] [http] base64模式");
 
         // 先拿二进制
         const arrayBuffer = await response.arrayBuffer();
@@ -94,7 +179,7 @@ export async function httpGet(url, options = {}) {
         data = btoa(binary); // 得到 base64 字符串
 
       } else if (options.zlibMode) {
-        log("info", "zlib模式")
+        log("info", "[system] [http] zlib模式")
 
         // 获取 ArrayBuffer
         const arrayBuffer = await response.arrayBuffer();
@@ -110,12 +195,12 @@ export async function httpGet(url, options = {}) {
           try {
             decodedData = await decompressedStream.text();
           } catch (e) {
-            log("error", "[请求模拟] 解压缩失败", e);
+            log("error", `[${currentSource}] [请求模拟] 解压缩失败`, e);
             throw e;
           }
         } else {
           // iOS巨魔环境降级处理：使用pako库
-          log("info", "iOS环境降级使用pako解压");
+          log("info", "[system] [http] iOS环境降级使用pako解压");
           try {
             // 动态导入pako库
             const pako = await import('pako');
@@ -124,7 +209,7 @@ export async function httpGet(url, options = {}) {
             // 转换为字符串
             decodedData = new TextDecoder('utf-8').decode(inflateResult);
           } catch (e) {
-            log("error", "[请求模拟] pako解压缩失败", e);
+            log("error", `[${currentSource}] [请求模拟] pako解压缩失败`, e);
             throw e;
           }
         }
@@ -161,7 +246,12 @@ export async function httpGet(url, options = {}) {
 
       // 请求成功，返回结果
       if (attempt > 0) {
-        log("info", `[请求模拟] 重试成功`);
+        log("info", `[${currentSource}] [请求模拟] 重试成功`);
+      }
+
+      // 将本次响应记入请求内复用缓存, 供同请求内相同 URL 的后续请求直接复用
+      if (requestHttpCache && !bypassCache) {
+        requestHttpCache.set(url, { data: structuredClone(parsedData), status: response.status, headers });
       }
 
       // 模拟 iOS 环境：返回 { data: ... } 结构
@@ -174,6 +264,7 @@ export async function httpGet(url, options = {}) {
     } catch (error) {
       clearTimeout(timeoutId);
       lastError = error;
+      const currentSource = sourceLogContext.getStore() || "system";
 
       // 如果是外部信号导致的中断，停止重试并直接抛出
       if (options.signal?.aborted) {
@@ -182,13 +273,13 @@ export async function httpGet(url, options = {}) {
 
       // 检查是否是超时错误
       if (error.name === 'AbortError') {
-        log("error", `[请求模拟] 请求超时:`, error.message);
+        log("error", `[${currentSource}] [请求模拟] 请求超时:`, error.message);
         log("error", '详细诊断:');
         log("error", '- URL:', url);
         log("error", '- 超时时间:', `${timeout}ms`);
         log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
       } else {
-        log("error", `[请求模拟] 请求失败:`, error.message);
+        log("error", `[${currentSource}] [请求模拟] 请求失败:`, error.message);
         log("error", '详细诊断:');
         log("error", '- URL:', url);
         log("error", '- 错误类型:', error.name);
@@ -202,30 +293,42 @@ export async function httpGet(url, options = {}) {
 
       // 如果还有重试机会，继续循环；否则在循环结束后抛出错误
       if (attempt < maxRetries) {
-        log("info", `[请求模拟] 准备重试...`);
+        log("info", `[${currentSource}] [请求模拟] 准备重试...`);
         continue;
       }
+    } finally {
+      // 请求生命周期结束，释放监听器内存引用
+      cleanupSignal();
     }
   }
 
   // 所有重试都失败，抛出最后一个错误
-  log("error", `[请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
+  const finalSource = sourceLogContext.getStore() || "system";
+  log("error", `[${finalSource}] [请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
   throw lastError;
 }
 
 export async function httpPost(url, body, options = {}) {
   // 从 options 中获取重试次数，默认为 0
   const maxRetries = parseInt(options.retries || '0', 10) || 0;
+  const validStatusCodes = Array.isArray(options.validStatusCodes) ? options.validStatusCodes : [];
   let lastError;
 
   // 执行请求，包含重试逻辑
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const currentSource = sourceLogContext.getStore() || "system";
+
     if (attempt > 0) {
-      log("info", `[请求模拟] 第 ${attempt} 次重试: ${url}`);
-      // 可选：添加重试延迟（指数退避）
-      await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+      log("info", `[${currentSource}] [请求模拟] 第 ${attempt} 次重试: ${url}`);
+      // 针对网络层物理阻断（如 ETIMEDOUT, ECONNRESET, AbortError）取消长退避，实现快速重试
+      // 常规服务端报错（如 502, 429）保持指数退避逻辑
+      if (lastError && (lastError.cause?.code === 'ETIMEDOUT' || lastError.cause?.code === 'ECONNRESET' || lastError.name === 'AbortError')) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } else {
+        await new Promise(resolve => setTimeout(resolve, Math.min(1000 * Math.pow(2, attempt - 1), 5000)));
+      }
     } else {
-      log("info", `[请求模拟] HTTP POST: ${url}`);
+      log("info", `[${currentSource}] [请求模拟] HTTP POST: ${url}`);
     }
 
     // 设置超时时间（默认5秒）
@@ -233,8 +336,8 @@ export async function httpPost(url, body, options = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-    // 链接外部中断信号
-    linkSignal(options.signal, controller);
+    // 链接外部中断信号并获取清理函数
+    const cleanupSignal = linkSignal(options.signal, controller);
 
     // 处理请求头、body 和其他参数
     const { headers = {}, params, allow_redirects = true } = options;
@@ -252,12 +355,11 @@ export async function httpPost(url, body, options = {}) {
     }
 
     try {
-      // 兼容iOS巨魔环境：使用node-fetch替代内置fetch
+      // 兼容iOS巨魔或旧版Node：使用node-fetch替代内置fetch
       let response;
-      if (typeof WebAssembly === 'undefined') {
-        log("info", "iOS环境降级使用node-fetch");
+      if (shouldUseNodeFetch()) {
         const fetch = (await import('node-fetch')).default;
-        response = await fetch(url, fetchOptions);
+        response = await fetch(url, { ...fetchOptions, agent: nodeFetchAgent });
       } else {
         // 现代浏览器环境
         response = await fetch(url, fetchOptions);
@@ -267,9 +369,8 @@ export async function httpPost(url, body, options = {}) {
 
       const data = await response.text();
 
-
-      if (!response.ok) {
-        log("error", `[请求模拟] response data: `, data);
+      if (!response.ok && !validStatusCodes.includes(response.status)) {
+        log("error", `[${currentSource}] [请求模拟] response data: `, data);
         throw new Error(`HTTP error! status: ${response.status}`);
       }
 
@@ -282,7 +383,7 @@ export async function httpPost(url, body, options = {}) {
 
       // 请求成功，返回结果
       if (attempt > 0) {
-        log("info", `[请求模拟] 重试成功`);
+        log("info", `[${currentSource}] [请求模拟] 重试成功`);
       }
 
       // 模拟 iOS 环境：返回 { data: ... } 结构
@@ -295,6 +396,7 @@ export async function httpPost(url, body, options = {}) {
     } catch (error) {
       clearTimeout(timeoutId);
       lastError = error;
+      const currentSource = sourceLogContext.getStore() || "system";
 
       // 如果是外部信号导致的中断，停止重试并直接抛出
       if (options.signal?.aborted) {
@@ -303,13 +405,13 @@ export async function httpPost(url, body, options = {}) {
 
       // 检查是否是超时错误
       if (error.name === 'AbortError') {
-        log("error", `[请求模拟] 请求超时:`, error.message);
+        log("error", `[${currentSource}] [请求模拟] 请求超时:`, error.message);
         log("error", '详细诊断:');
         log("error", '- URL:', url);
         log("error", '- 超时时间:', `${timeout}ms`);
         log("error", `- 当前尝试: ${attempt + 1}/${maxRetries + 1}`);
       } else {
-        log("error", `[请求模拟] 请求失败:`, error.message);
+        log("error", `[${currentSource}] [请求模拟] 请求失败:`, error.message);
         log("error", '详细诊断:');
         log("error", '- URL:', url);
         log("error", '- 错误类型:', error.name);
@@ -323,14 +425,18 @@ export async function httpPost(url, body, options = {}) {
 
       // 如果还有重试机会，继续循环；否则在循环结束后抛出错误
       if (attempt < maxRetries) {
-        log("info", `[请求模拟] 准备重试...`);
+        log("info", `[${currentSource}] [请求模拟] 准备重试...`);
         continue;
       }
+    } finally {
+      // 请求生命周期结束，释放监听器内存引用
+      cleanupSignal();
     }
   }
 
   // 所有重试都失败，抛出最后一个错误
-  log("error", `[请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
+  const finalSource = sourceLogContext.getStore() || "system";
+  log("error", `[${finalSource}] [请求模拟] 所有重试均失败 (${maxRetries + 1} 次尝试)`);
   throw lastError;
 }
 
@@ -346,9 +452,11 @@ export async function httpPost(url, body, options = {}) {
  * @returns {Promise<{data: any, status: number, headers: Record<string, string>}>}
  */
 async function httpRequestMethod(method, url, body, options = {}) {
-  log("info", `[请求模拟] HTTP ${method}: ${url}`);
+  const currentSource = sourceLogContext.getStore() || "system";
+  log("info", `[${currentSource}] [请求模拟] HTTP ${method}: ${url}`);
 
-  const { headers = {}, params, allow_redirects = true } = options;
+  const { headers = {} } = options;
+  const validStatusCodes = Array.isArray(options.validStatusCodes) ? options.validStatusCodes : [];
 
   const fetchOptions = {
     method,
@@ -360,17 +468,28 @@ async function httpRequestMethod(method, url, body, options = {}) {
     fetchOptions.body = body;
   }
 
+  if (options.body !== undefined && options.body !== null) {
+    fetchOptions.body = options.body;
+  }
+
   // 如果传递了 signal，直接透传给 fetch
   if (options.signal) {
     fetchOptions.signal = options.signal;
   }
 
   try {
-    const response = await fetch(url, fetchOptions);
+    // 兼容iOS巨魔或旧版Node：使用node-fetch替代内置fetch
+    let response;
+    if (shouldUseNodeFetch()) {
+      const fetch = (await import('node-fetch')).default;
+      response = await fetch(url, { ...fetchOptions, agent: nodeFetchAgent });
+    } else {
+      response = await fetch(url, fetchOptions);
+    }
     const textData = await response.text();
 
-    if (!response.ok) {
-      log("error", `[请求模拟] response data: `, textData);
+    if (!response.ok && !validStatusCodes.includes(response.status)) {
+      log("error", `[${currentSource}] [请求模拟] response data: `, textData);
       throw new Error(`HTTP error! status: ${response.status}`);
     }
 
@@ -387,7 +506,8 @@ async function httpRequestMethod(method, url, body, options = {}) {
       headers: Object.fromEntries(response.headers.entries())
     };
   } catch (error) {
-    log("error", `[请求模拟] 请求失败:`, error.message);
+    const currentSource = sourceLogContext.getStore() || "system";
+    log("error", `[${currentSource}] [请求模拟] 请求失败:`, error.message);
     log("error", '详细诊断:');
     log("error", '- URL:', url);
     log("error", '- 错误类型:', error.name);
@@ -444,7 +564,8 @@ export async function getPageTitle(url) {
     return url;
 
   } catch (error) {
-    log("error", `获取标题失败: ${error.message}`);
+    const currentSource = sourceLogContext.getStore() || "system";
+    log("error", `[${currentSource}] 获取标题失败: ${error.message}`);
     return url;
   }
 }
@@ -452,7 +573,7 @@ export async function getPageTitle(url) {
 export function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 
+    headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*"
     }
@@ -468,8 +589,19 @@ export function xmlResponse(data, status = 200) {
   // 直接返回 XML 字符串作为 Response 的 body
   return new Response(data, {
     status,
-    headers: { 
+    headers: {
       "Content-Type": "application/xml",
+      "Access-Control-Allow-Origin": "*"
+    }
+  });
+}
+
+export function binResponse(data, filename = "data.bin", status = 200) {
+  return new Response(data, {
+    status,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${filename}"`,
       "Access-Control-Allow-Origin": "*"
     }
   });
@@ -601,22 +733,35 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
   const { headers = {}, sniffLimit } = options;
   // 默认限制为 32KB
   const SNIFF_LIMIT = parseInt(sniffLimit || '32768', 10) || 32768;
-  const timeout = parseInt(globals.vodRequestTimeout || '5000', 10) || 5000;
+  const timeout = parseInt(options.timeout || globals.vodRequestTimeout || '5000', 10) || 5000;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-  // 链接外部中断信号
-  linkSignal(options.signal, controller);
+  // 链接外部中断信号并获取清理函数
+  const cleanupSignal = linkSignal(options.signal, controller);
 
   try {
-    log("info", `[流式请求] HTTP GET: ${url}`);
+    const currentSource = sourceLogContext.getStore() || "system";
+    log("info", `[${currentSource}] [流式请求] HTTP GET: ${url}`);
 
-    const response = await fetch(url, {
-      method: 'GET',
-      headers: headers,
-      signal: controller.signal
-    });
+    // 兼容iOS巨魔或旧版Node：使用node-fetch替代内置fetch
+    let response;
+    if (shouldUseNodeFetch()) {
+      const fetch = (await import('node-fetch')).default;
+      response = await fetch(url, {
+        method: 'GET',
+        headers: headers,
+        signal: controller.signal,
+        agent: nodeFetchAgent
+      });
+    } else {
+      response = await fetch(url, {
+        method: 'GET',
+        headers: headers,
+        signal: controller.signal
+      });
+    }
 
     if (!response.ok) {
       throw new Error(`HTTP error! status: ${response.status}`);
@@ -626,12 +771,13 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
 
     // 环境兼容性回退
     if (!reader) {
-      log("warn", "[流式请求] 环境不支持流式读取,回退到普通请求");
+      const currentSource = sourceLogContext.getStore() || "system";
+      log("warn", `[${currentSource}] [流式请求] 环境不支持流式读取,回退到普通请求`);
       const text = await response.text();
       clearTimeout(timeoutId);
       if (checkCallback && !checkCallback(text.slice(0, SNIFF_LIMIT))) {
-          log("info", "[流式请求] 检测到无效数据(回退模式),丢弃结果");
-          return null;
+        log("info", `[${currentSource}] [流式请求] 检测到无效数据(回退模式),丢弃结果`);
+        return null;
       }
       try { return JSON.parse(text); } catch { return text; }
     }
@@ -645,7 +791,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     let stopChecking = false; // 标记是否停止检查
 
     // 流式读取循环
-    while(true) {
+    while (true) {
       const { done, value } = await reader.read();
 
       if (done) break;
@@ -656,12 +802,13 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
       // 1. 数据嗅探逻辑 (仅在前 SNIFF_LIMIT 范围内执行)
       if (!stopChecking && checkCallback) {
         // 累积文本
-        const chunkText = new TextDecoder("utf-8").decode(value, {stream: true});
+        const chunkText = new TextDecoder("utf-8").decode(value, { stream: true });
         checkBuffer += chunkText;
 
         // 执行回调检查
         if (!checkCallback(checkBuffer)) {
-          log("info", `[流式请求] 嗅探到无效特征(已读${receivedLength}字节),立即熔断`);
+          const currentSource = sourceLogContext.getStore() || "system";
+          log("info", `[${currentSource}] [流式请求] 嗅探到无效特征(已读${receivedLength}字节),立即熔断`);
           controller.abort();
           isAborted = true;
           break;
@@ -669,8 +816,8 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
 
         // 如果缓冲区超过限制
         if (receivedLength > SNIFF_LIMIT) {
-            stopChecking = true;
-            checkBuffer = null; // 释放缓冲区内存
+          stopChecking = true;
+          checkBuffer = null; // 释放缓冲区内存
         }
       }
 
@@ -684,7 +831,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     // 2. 拼接完整数据
     let chunksAll = new Uint8Array(receivedLength);
     let position = 0;
-    for(let chunk of chunks) {
+    for (let chunk of chunks) {
       chunksAll.set(chunk, position);
       position += chunk.length;
     }
@@ -697,11 +844,15 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
     }
 
   } catch (error) {
+    const currentSource = sourceLogContext.getStore() || "system";
     clearTimeout(timeoutId);
     if (error.name === 'AbortError') {
-       return null;
+      return null;
     }
-    log("error", `[流式请求] 失败: ${error.message}`);
+    log("error", `[${currentSource}] [流式请求] 失败: ${error.message}`);
     return null;
+  } finally {
+    // 流式请求执行完毕或被熔断拦截，释放监听器内存引用
+    cleanupSignal();
   }
 }
