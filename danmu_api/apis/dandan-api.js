@@ -1464,6 +1464,10 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
     score: -9999 // 初始分数为极低值
   };
 
+  // 所有「标题+年份+季集」均命中的候选；用于按弹幕数决定默认源
+  const candidates = [];
+  let preferredHit = false;
+
   const normalizedTitle = normalizeSpaces(title);
 
   // 遍历所有搜索结果，寻找最佳匹配
@@ -1636,7 +1640,8 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
         // Penalize titles that are clearly derivative content (大聪明版, 解说, reaction, etc.)
         const derivativeKeywords = ["大聪明版", "解说", "reaction", "一口气", "看完", "看爽", "速看", "合集", "剪辑", "混剪", "盘点"];
         const titleLower = anime.animeTitle.toLowerCase();
-        if (derivativeKeywords.some(kw => titleLower.includes(kw.toLowerCase()))) {
+        const isDerivative = derivativeKeywords.some(kw => titleLower.includes(kw.toLowerCase()));
+        if (isDerivative) {
             currentScore -= 2000; // Heavy penalty for derivative content
         }
 
@@ -1647,6 +1652,16 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
         }
 
         log("info", `[matchAniAndEp] Score for ${anime.animeTitle}: ${currentScore} (type=${typeDesc}, platform=${platform || 'none'})`);
+
+        // 收集所有「标题/年份/季集」都命中的候选，供后续按弹幕数排名使用
+        candidates.push({
+            anime,
+            episode: matchedEpisode,
+            score: currentScore,
+            platformScore: platform ? getPlatformMatchScore(candidatePlatform, platform) : 0,
+            isDerivative,
+            typeDesc
+        });
 
         // 比较并更新最佳结果
         if (currentScore > bestRes.score) {
@@ -1659,12 +1674,61 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
 
         // 已命中最高优先级的手动优选，立刻跳出查找（其 +9999 必然胜出，无需继续比较）
         if (isPreferredAnime) {
+            preferredHit = true;
             break;
         }
 
         // 注意：此处刻意不保留上游的 (!platform && !preferAnimeId) 提前跳出。
         // 无平台偏好时若命中首个结果即退出，下方的类型/标题/衍生内容评分将永远不起作用，
         // 无法把「电视剧」正片排到「解说/reaction」等衍生内容之前。故继续遍历取最高分。
+    }
+  }
+
+  // ====== 按弹幕数决定默认源 ======
+  // 走到这里的候选，标题、年份、季集都已命中，彼此是等价的；此时弹幕多的观感更好，作为默认返回。
+  if (globals.matchDanmuRank && !preferredHit && candidates.length > 1) {
+    // 衍生内容（解说/reaction/合集）弹幕往往极多，若存在正片候选则先排除，避免默认源被劫持
+    const nonDerivative = candidates.filter(c => !c.isDerivative);
+    let pool = nonDerivative.length > 0 ? nonDerivative : candidates;
+
+    // 指定了平台偏好(@qiyi 等)时，平台优先级高于弹幕数：只在最高平台分内部比较
+    if (platform) {
+      const maxPlatformScore = Math.max(...pool.map(c => c.platformScore));
+      pool = pool.filter(c => c.platformScore === maxPlatformScore);
+    }
+
+    if (pool.length > 1) {
+      // 只探测评分最高的前 N 个，控制耗时（serverless 上尤其重要）
+      const topN = Math.max(1, globals.matchDanmuRankTopN || 5);
+      const probes = [...pool].sort((a, b) => b.score - a.score).slice(0, topN);
+      const timeoutMs = globals.matchDanmuRankTimeout || 6000;
+
+      log("info", `[matchAniAndEp] 按弹幕数排名，探测 ${probes.length}/${pool.length} 个候选...`);
+
+      const counts = await Promise.allSettled(probes.map(async (c) => {
+        const epUrl = c.episode?.url || findUrlById(c.episode?.episodeId);
+        if (!epUrl) return 0;
+        return await fetchDanmuCountByUrl(epUrl, timeoutMs);
+      }));
+
+      let winner = null;
+      for (let i = 0; i < probes.length; i++) {
+        probes[i].danmuCount = counts[i].status === 'fulfilled' ? (counts[i].value || 0) : 0;
+        log("info", `[matchAniAndEp] 弹幕数 ${probes[i].danmuCount} — ${probes[i].anime.animeTitle}`);
+        // 弹幕数为主排序，数量相同时用原评分（类型/标题/平台）兜底
+        if (!winner || probes[i].danmuCount > winner.danmuCount ||
+            (probes[i].danmuCount === winner.danmuCount && probes[i].score > winner.score)) {
+          winner = probes[i];
+        }
+      }
+
+      // 全部为 0 说明源不可用或超时，此时保持原评分结果，避免退化成任意挑选
+      if (winner && winner.danmuCount > 0) {
+        log("info", `[matchAniAndEp] 默认源 -> ${winner.anime.animeTitle}（弹幕 ${winner.danmuCount}）`);
+        bestRes = { anime: winner.anime, episode: winner.episode, score: winner.score };
+      } else {
+        log("info", `[matchAniAndEp] 候选弹幕数均为 0，回退到类型/标题评分结果`);
+      }
     }
   }
 
