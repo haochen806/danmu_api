@@ -754,6 +754,7 @@ export class Envs {
       matchDanmuRank: this.get('MATCH_DANMU_RANK', true, 'boolean'), // match自动匹配时，在标题/年份/集数都命中的候选中，优先返回弹幕数最多的源（默认 true）
       matchDanmuRankTopN: this.get('MATCH_DANMU_RANK_TOP_N', 5, 'number'), // 参与弹幕数排名的候选上限，越大越准但越慢（默认 5）
       matchDanmuRankTimeout: this.get('MATCH_DANMU_RANK_TIMEOUT', 6000, 'number'), // 单个候选拉取弹幕数的超时时间(ms)（默认 6000）
+      matchAllowDerivativeOnly: this.get('MATCH_ALLOW_DERIVATIVE_ONLY', false, 'boolean'), // 当只剩解说/合集/一口气看完等衍生内容候选时，是否仍自动匹配（默认 false，宁可不匹配交由手动选择）
       MAX_LAST_SELECT_MAP: this.get('MAX_LAST_SELECT_MAP', 100, 'number'), // 记住上次选择映射缓存大小限制（默认 100）
       MAX_ANIMES: this.get('MAX_ANIMES', 100, 'number'), // 动漫标题缓存最大数量（默认 100）
       bangumiDataCacheDays: this.get('BANGUMI_DATA_CACHE_DAYS', 7, 'number'), // Bangumi Data 缓存有效期(天)，默认7天

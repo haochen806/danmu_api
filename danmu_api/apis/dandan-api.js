@@ -1732,6 +1732,16 @@ async function matchAniAndEp(season, episode, year, searchData, title, req, plat
     }
   }
 
+  // ====== 衍生内容兜底保护 ======
+  // -2000 的衍生惩罚只在「有正片可比」时才起作用；若某次搜索里正片源全部失败，
+  // 只剩解说/合集/一口气看完这类候选，它仍会以负分胜出成为默认弹幕。
+  // 这种情况下宁可不自动匹配，让播放器回退到手动选择，也好过默认加载解说视频的弹幕。
+  if (!globals.matchAllowDerivativeOnly && bestRes.anime &&
+      candidates.length > 0 && candidates.every(c => c.isDerivative)) {
+    log("info", `[matchAniAndEp] 仅剩衍生内容候选（${bestRes.anime.animeTitle}），放弃自动匹配`);
+    bestRes = { anime: null, episode: null, score: -9999 };
+  }
+
   //  跨季集数顺延映射匹配逻辑
   if (!bestRes.episode && season && episode) {
     const spilloverRes = findCrossSeasonEpisodeMap(searchData, title, year, season, episode, platform, detailStore);
