@@ -49,7 +49,9 @@ VOD_REQUEST_TIMEOUT: 10000
 
 # Bilibili Cookie（用于访问需要登录的内容）
 # 默认值：空（不使用 Cookie）
-BILIBILI_COOKIE: "SESSDATA=b8684a3f%2C1780689132%2C3b582%2Ac1CjA9IdQJgmqPw7FjZE7wNtjjGd_uqRGH4QeUNSlX09IfGPYjIKOE3FEdHz8h8-zsh6ISVkJsTVYwRDVsUGowWXZXVkdjSWpvVzU2UTJ1bTJaeHJRQmdtSUVRai1lb0dIcmJDakttMEV5Y0U5SDhQb1VUakFiUGZ6WnFTaExROFNYbXMzOWRiaS1RIIEC; bili_jct=65f41872c6c24477c1b19a50549a7fc9; DedeUserID=91108; DedeUserID__ckMd5=03b2162fd5590abf"
+# NOTE: never commit a real cookie here — this file is tracked in a public repo.
+# Set BILIBILI_COOKIE as an environment variable instead (env vars take precedence).
+BILIBILI_COOKIE: ""
 
 # ==================== 优酷配置 ====================
 
