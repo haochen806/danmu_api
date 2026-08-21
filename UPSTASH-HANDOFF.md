@@ -204,10 +204,46 @@ schema to undo. The Upstash DB can be left in place or deleted.
 
 ## 9. Open items
 
-- **The Pi instance may not be persisting either.** No `.cache` directory was found
-  at `~/danmu_api` or inside the `danmu-api` container. Check the Pi's `/api/config`
-  for `localCacheValid` / `localRedisValid`. If both are false, preference loss
-  attributed to Vercel is happening in both places. **Still unchecked.**
+- **RESOLVED 2026-08-21 — the Pi is NOT persisting either.** Checked `GET
+  /api/config` on the Pi (`127.0.0.1:9321`): `deployPlatform: 'node'`,
+  `localCacheValid: False`, `redisValid: False`, `localRedisValid: False`,
+  `UPSTASH_REDIS_REST_URL: ''`, `LOCAL_REDIS_URL: ''`, `MAX_LAST_SELECT_MAP: 100`.
+  So preference loss was happening in **both** deployments; Vercel is now fixed and
+  the Pi is not.
+
+  **Cause.** `judgeLocalCacheValid()` (`utils/cache-util.js:900`) only *checks* for
+  the cache dir, it never creates it:
+
+  ```js
+  const cacheDirPath = path.join(getDirname(), '..', '..', '.cache');
+  if (fs.existsSync(cacheDirPath)) globals.localCacheValid = true;
+  else                             globals.localCacheValid = false;
+  ```
+
+  Resolved path in the container is `/app/.cache`. Confirmed absent both in the
+  container (`WorkingDir: /app`, no `.cache` in the listing) and on the host
+  (`~/danmu_api/.cache` does not exist). No dir -> flag false -> the file write is
+  skipped silently, with nothing logged. That is why it went unnoticed.
+
+  **Fix (NOT APPLIED — needs a maintenance window):**
+  1. `mkdir -p ~/danmu_api/.cache` on the host.
+  2. Recreate the container with the dir bind-mounted so it survives replacement:
+     `-v /home/chen806/danmu_api/.cache:/app/.cache`
+  3. Confirm `localCacheValid: true` at `/api/config`.
+
+  **Caution:** the container was started with a bare `docker run` — no compose file,
+  no labels — so the original command is recorded nowhere. Current mounts are only
+  two single files (`config.yaml` -> `/app/config.yaml`, `.env` ->
+  `/app/config/.env`), restart policy `unless-stopped`, published
+  `0.0.0.0:9321->9321`. Reconstruct the full command from `docker inspect
+  danmu-api` before removing the container — or better, write a compose file first
+  so this is reproducible. It has been serving continuously for 5 days; do this
+  when you can watch it.
+
+  Alternatively, point the Pi at the same Upstash DB by setting the two
+  `UPSTASH_REDIS_REST_*` vars in `~/danmu_api/.env` — no container recreation
+  needed, and both deployments would then share one preference store. Note the
+  free tier is per-database, so command usage would combine.
 - `configs/handlers/vercel-handler.js` can read/write Vercel env vars via the API
   using `DEPLOY_PLATFROM_TOKEN` (typo is in the source). That is for *configuration*
   persistence, not runtime state. Do not use it for `lastSelectMap`.
